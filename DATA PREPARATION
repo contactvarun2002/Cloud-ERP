@@ -1,0 +1,420 @@
+# ============================================================
+# CLOUD ERP — STEP 1: DATA PREPARATION
+# Copy this entire block into one Google Colab code cell.
+# ============================================================
+
+import csv
+import gzip
+import json
+import re
+from collections import defaultdict
+from datetime import datetime, timezone
+from functools import lru_cache
+from pathlib import Path
+from zipfile import BadZipFile, ZipFile
+
+import pandas as pd
+from google.colab import drive
+from sklearn.model_selection import train_test_split
+
+
+# 1. Google Drive paths
+
+DRIVE = Path("/content/drive/MyDrive")
+if not DRIVE.is_dir():
+    drive.mount("/content/drive")
+
+DATA = DRIVE / "Cloud ERP"
+SAP_ARCHIVE = DATA / "archive (3)"
+IBM_ARCHIVE = DATA / "archive (4)"
+CLARKNET_LOGS = [
+    DATA / "clarknet_access_log_Aug28.gz",
+    DATA / "clarknet_access_log_Sep4.gz",
+]
+OUTPUT = DRIVE / "Cloud_ERP_Fresh_Project" / "Step1_Preprocessed"
+
+SEED = 42
+MIN_SAP_CLASS_SIZE = 20
+
+
+# 2. Shared CSV and splitting functions
+
+def has_columns(stream, required):
+    line = stream.readline(65536).decode("utf-8-sig", errors="replace")
+    columns = next(csv.reader([line]), [])
+    return required <= {column.strip().upper() for column in columns}
+
+
+def read_dataset(base, required, **read_options):
+    matches = []
+
+    if base.is_dir():
+        for path in sorted(base.rglob("*")):
+            if not path.is_file() or path.suffix.lower() != ".csv":
+                continue
+            with path.open("rb") as stream:
+                if has_columns(stream, required):
+                    matches.append(path)
+
+    if len(matches) > 1:
+        raise ValueError(f"Multiple matching CSVs in {base}: {matches}")
+
+    if matches:
+        source = str(matches[0])
+        frame = pd.read_csv(matches[0], **read_options)
+    else:
+        zip_path = base if base.is_file() else base.with_suffix(".zip")
+        if not zip_path.is_file():
+            raise FileNotFoundError(
+                f"No CSV with columns {sorted(required)} found in {base} or {zip_path}."
+            )
+
+        with ZipFile(zip_path) as archive:
+            members = []
+            for member in archive.infolist():
+                if member.is_dir() or not member.filename.lower().endswith(".csv"):
+                    continue
+                with archive.open(member) as stream:
+                    if has_columns(stream, required):
+                        members.append(member)
+
+            if len(members) != 1:
+                raise ValueError(
+                    f"Expected one matching CSV in {zip_path}. "
+                    f"Found {[member.filename for member in members]}."
+                )
+
+            source = f"{zip_path} [{members[0].filename}]"
+            with archive.open(members[0]) as stream:
+                frame = pd.read_csv(stream, **read_options)
+
+    if frame.empty:
+        raise ValueError(f"Empty dataset: {source}")
+
+    frame.columns = frame.columns.str.strip().str.lstrip("\ufeff")
+    print(f"Using {source}", flush=True)
+    return frame, source
+
+
+def make_text(frame, fields, context):
+    if not fields:
+        return [context] * len(frame)
+
+    values = frame[fields].astype(object)
+    values = values.where(values.notna(), "unknown")
+    return [
+        context + ". " + "; ".join(
+            f"{field}={value}" for field, value in zip(fields, row)
+        )
+        for row in values.itertuples(index=False, name=None)
+    ]
+
+
+def stratified_splits(frame):
+    train, holdout = train_test_split(
+        frame, test_size=0.20, random_state=SEED, stratify=frame["target"]
+    )
+    validation, test = train_test_split(
+        holdout, test_size=0.50, random_state=SEED, stratify=holdout["target"]
+    )
+    splits = {"train": train, "validation": validation, "test": test}
+
+    expected_labels = set(frame["target"])
+    if any(set(split["target"]) != expected_labels for split in splits.values()):
+        raise ValueError("Every class must have records in all three splits.")
+
+    return splits
+
+
+# 3. SAP sales document classification
+
+def prepare_sap(folder):
+    raw, source = read_dataset(SAP_ARCHIVE, {"VBELN", "AUART"}, dtype="string")
+    raw.columns = raw.columns.str.upper()
+
+    keys = ["MANDT", "VBELN"] if "MANDT" in raw else ["VBELN"]
+    numeric = ["NETWR"] if "NETWR" in raw else []
+    categorical = [
+        name for name in ["WAERK", "VKORG", "VTWEG", "SPART", "VKBUR", "VKGRP"]
+        if name in raw
+    ]
+    date_columns = ["ERDAT"] if "ERDAT" in raw else []
+
+    fields = keys + ["AUART"] + numeric + categorical + date_columns
+    data = raw[fields].apply(lambda col: col.str.strip().replace("", pd.NA))
+    data["AUART"] = data["AUART"].str.upper()
+
+    valid = data.dropna(subset=keys + ["AUART"])
+    unique_rows = valid.drop_duplicates()
+    conflicting = unique_rows.duplicated(keys, keep=False)
+    conflicts = unique_rows.loc[conflicting].copy()
+
+    if not conflicts.empty:
+        conflicts.insert(0, "source_record_number", conflicts.index + 1)
+        conflicts.to_csv(folder / "VBAK_Conflicting_Documents.csv", index=False)
+        print(f"SAP: saved {len(conflicts):,} conflicting rows for review.")
+
+    data = unique_rows.loc[~conflicting].copy()
+    counts = data["AUART"].value_counts()
+    supported = counts[counts >= MIN_SAP_CLASS_SIZE]
+
+    if len(supported) < 2:
+        raise ValueError(
+            f"SAP needs at least two AUART classes with {MIN_SAP_CLASS_SIZE} "
+            f"records each. Found {counts.to_dict()}."
+        )
+
+    data = data[data["AUART"].isin(supported.index)].copy()
+
+    if date_columns:
+        compact = pd.to_datetime(data["ERDAT"], format="%Y%m%d", errors="coerce")
+        iso = pd.to_datetime(data["ERDAT"], format="%Y-%m-%d", errors="coerce")
+        created = compact.fillna(iso)
+        if created.notna().any():
+            data["created_month"] = created.dt.month
+            data["created_weekday"] = created.dt.dayofweek
+            numeric.extend(["created_month", "created_weekday"])
+
+    for field in numeric:
+        data[field] = pd.to_numeric(data[field], errors="coerce")
+
+    features = numeric + categorical
+    if not features:
+        raise ValueError("SAP VBAK needs predictor columns such as NETWR, VKORG, or ERDAT.")
+
+    data["record_id"] = data[keys].agg("/".join, axis=1)
+    data["target"] = data["AUART"]
+    data["semantic_text"] = make_text(data, features, "SAP sales document")
+
+    columns = ["record_id", *features, "semantic_text", "target"]
+    return stratified_splits(data[columns]), {
+        "task": "classification",
+        "target_definition": "SAP VBAK sales document type (AUART)",
+        "source": source,
+        "source_rows": len(raw),
+        "missing_key_or_label_rows": len(raw) - len(valid),
+        "duplicate_model_rows_removed": len(valid) - len(unique_rows),
+        "conflicting_rows_excluded": len(conflicts),
+        "conflicting_document_keys_excluded": len(conflicts.drop_duplicates(keys)),
+        "excluded_rare_classes": counts[counts < MIN_SAP_CLASS_SIZE].to_dict(),
+        "numeric_features": numeric,
+        "categorical_features": categorical,
+    }
+
+
+# 4. IBM HR attrition classification
+
+def prepare_ibm(_folder):
+    raw, source = read_dataset(IBM_ARCHIVE, {"ATTRITION", "EMPLOYEENUMBER"})
+    canonical = {"ATTRITION": "Attrition", "EMPLOYEENUMBER": "EmployeeNumber"}
+    data = raw.rename(columns=lambda name: canonical.get(name.upper(), name))
+    data = data.drop_duplicates().reset_index(drop=True)
+
+    labels = data.pop("Attrition").astype("string").str.strip().str.lower()
+    ids = data.pop("EmployeeNumber").astype("string").str.strip()
+
+    if labels.isna().any() or set(labels) != {"yes", "no"}:
+        raise ValueError("IBM Attrition must contain Yes and No with no missing labels.")
+
+    if ids.isna().any() or ids.eq("").any() or ids.duplicated().any():
+        raise ValueError("IBM EmployeeNumber must be present and unique after deduplication.")
+
+    data = data.drop(columns=["EmployeeCount", "StandardHours", "Over18"], errors="ignore")
+    categorical = data.select_dtypes(exclude="number").columns.tolist()
+    numeric = [name for name in data if name not in categorical]
+
+    data.insert(0, "record_id", ids)
+    data["semantic_text"] = make_text(data, categorical, "IBM employee profile")
+    data["target"] = labels.map({"no": 0, "yes": 1}).astype(int)
+
+    return stratified_splits(data), {
+        "task": "classification",
+        "target_definition": "Employee attrition, No=0 and Yes=1",
+        "source": source,
+        "source_rows": len(raw),
+        "duplicate_rows_removed": len(raw) - len(data),
+        "numeric_features": numeric,
+        "categorical_features": categorical,
+    }
+
+
+# 5. ClarkNet next-minute workload forecasting
+
+LOG_PATTERN = re.compile(
+    rb'^\S+.*?\[([^\]]+)\]\s+"(.*)"\s+(\d{3})\s+(\d+|-)(?:\s|$)'
+)
+APACHE_TIME = re.compile(
+    rb"^(\d{2}/[A-Za-z]{3}/\d{4}:\d{2}:\d{2}):\d{2} ([+-]\d{4})$"
+)
+ARCHIVE_TIME = re.compile(
+    rb"^(?:[A-Za-z]{3} )?([A-Za-z]{3}\s+\d{1,2} \d{2}:\d{2}):\d{2} (\d{4})$"
+)
+
+
+@lru_cache(maxsize=4096)
+def parse_minute(stamp):
+    apache = APACHE_TIME.fullmatch(stamp)
+    if apache:
+        value = b" ".join(apache.groups()).decode("ascii")
+        parsed = datetime.strptime(value, "%d/%b/%Y:%H:%M %z")
+    else:
+        archive = ARCHIVE_TIME.fullmatch(stamp)
+        if not archive:
+            raise ValueError("Unknown timestamp format.")
+        value = (b" ".join(archive.groups()) + b" -0400").decode("ascii")
+        parsed = datetime.strptime(value, "%b %d %H:%M %Y %z")
+
+    return parsed.astimezone(timezone.utc)
+
+
+def prepare_clarknet(folder):
+    buckets = defaultdict(lambda: [0, 0, 0, 0])
+    file_stats = {}
+    previous_last = None
+
+    for path in CLARKNET_LOGS:
+        print(f"Reading {path}", flush=True)
+        parsed = skipped = 0
+        first = last = None
+
+        with gzip.open(path, "rb") as stream:
+            for line in stream:
+                match = LOG_PATTERN.match(line)
+                if match is None:
+                    skipped += 1
+                    continue
+
+                try:
+                    minute = parse_minute(match[1])
+                except ValueError:
+                    skipped += 1
+                    continue
+
+                first = minute if first is None or minute < first else first
+                last = minute if last is None or minute > last else last
+
+                status = int(match[3])
+                values = buckets[minute]
+                values[0] += 1
+                values[1] += int(match[4]) if match[4] != b"-" else 0
+                values[2] += 400 <= status < 500
+                values[3] += 500 <= status < 600
+                parsed += 1
+
+        if not parsed:
+            raise ValueError(f"No valid requests parsed from {path.name}.")
+        if previous_last is not None and first <= previous_last:
+            raise ValueError(f"ClarkNet logs overlap or are out of order at {path.name}.")
+
+        previous_last = last
+        file_stats[path.name] = {"parsed": parsed, "skipped": skipped}
+        print(f"  Parsed {parsed:,} requests, skipped {skipped:,} lines.", flush=True)
+
+    current = ["requests", "response_bytes", "http_4xx", "http_5xx"]
+    minutes = pd.DataFrame.from_dict(buckets, orient="index", columns=current).sort_index()
+    minutes.index.name = "window_start_utc"
+    minutes = minutes.asfreq("min", fill_value=0)
+
+    observed = int(minutes["requests"].sum())
+    archive_count = 3_328_587
+    if observed != archive_count:
+        print(f"ClarkNet archive count difference: {observed - archive_count:+,}.")
+
+    data = minutes.copy()
+    data["requests_lag_1"] = data["requests"].shift(1)
+    data["requests_lag_5"] = data["requests"].shift(5)
+    data["requests_mean_5"] = data["requests"].rolling(5).mean()
+    local_time = data.index.tz_convert("Etc/GMT+4")
+    data["hour_local"] = local_time.hour
+    data["weekday_local"] = local_time.dayofweek
+
+    # Features come from the completed minute and its history.
+    # The label is the request count in the following minute.
+    data["target"] = data["requests"].shift(-1)
+    data = data.dropna(subset=["requests_lag_5", "target"]).copy()
+    data["target"] = data["target"].astype(int)
+    data["target_window_utc"] = data.index + pd.Timedelta(minutes=1)
+    data["semantic_text"] = make_text(data, current, "Completed ClarkNet traffic minute")
+    data = data.reset_index()
+
+    if len(data) < 10:
+        raise ValueError("Too few usable ClarkNet windows for an 80/10/10 split.")
+
+    cut1 = int(len(data) * 0.80)
+    cut2 = int(len(data) * 0.90)
+    splits = {
+        "train": data.iloc[:cut1],
+        "validation": data.iloc[cut1:cut2],
+        "test": data.iloc[cut2:],
+    }
+    minutes.to_csv(folder / "observed_minute_counts.csv")
+
+    return splits, {
+        "task": "regression",
+        "target_definition": "Request count in the next one-minute window",
+        "time_fields": ["window_start_utc", "target_window_utc"],
+        "numeric_features": current + [
+            "requests_lag_1", "requests_lag_5", "requests_mean_5",
+            "hour_local", "weekday_local",
+        ],
+        "categorical_features": [],
+        "raw_file_stats": file_stats,
+        "parsed_raw_requests": observed,
+        "archive_reported_requests": archive_count,
+        "raw_request_difference": observed - archive_count,
+    }
+
+
+# 6. Run Step 1 and save the split CSVs and summary
+
+run = OUTPUT / datetime.now(timezone.utc).strftime("Run_%Y%m%d_%H%M%S_%f")
+run.mkdir(parents=True, exist_ok=False)
+results = {}
+
+for name, prepare in [
+    ("SAP", prepare_sap),
+    ("IBM_HR", prepare_ibm),
+    ("ClarkNet", prepare_clarknet),
+]:
+    folder = run / name
+    folder.mkdir()
+
+    try:
+        splits, metadata = prepare(folder)
+        metadata["splits"] = {}
+
+        for split_name, frame in splits.items():
+            frame.to_csv(folder / f"{split_name}.csv", index=False)
+            details = {"rows": len(frame)}
+
+            if metadata["task"] == "classification":
+                details["class_counts"] = {
+                    str(label): int(count)
+                    for label, count in frame["target"].value_counts().items()
+                }
+            else:
+                details["first_target_window_utc"] = frame["target_window_utc"].iloc[0].isoformat()
+                details["last_target_window_utc"] = frame["target_window_utc"].iloc[-1].isoformat()
+
+            metadata["splits"][split_name] = details
+
+        (folder / "metadata.json").write_text(
+            json.dumps(metadata, indent=2), encoding="utf-8"
+        )
+        results[name] = {"status": "ready", **metadata}
+
+        counts = ", ".join(f"{split}={len(frame):,}" for split, frame in splits.items())
+        print(f"{name}: {counts}", flush=True)
+
+    except (OSError, ValueError, EOFError, BadZipFile, csv.Error) as error:
+        results[name] = {"status": "failed", "error": str(error)}
+        print(f"{name}: {error}", flush=True)
+
+(run / "Step1_Summary.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
+print(f"\nOutput folder: {run}", flush=True)
+
+failed = [name for name, result in results.items() if result["status"] != "ready"]
+if failed:
+    raise RuntimeError("STEP 1 INCOMPLETE. Check the messages for: " + ", ".join(failed))
+
+print("STEP 1 COMPLETE")
