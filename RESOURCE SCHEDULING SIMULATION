@@ -1,0 +1,359 @@
+# ============================================================
+# CLOUD ERP — STEP 4: RESOURCE SCHEDULING SIMULATION
+# Paste the entire block into one Google Colab code cell.
+# ============================================================
+
+import heapq
+import json
+import math
+from datetime import datetime, timezone
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from google.colab import drive
+from IPython.display import display
+
+# 1. Locate the completed Step 3 run.
+
+DRIVE = Path("/content/drive/MyDrive")
+if not DRIVE.is_dir():
+    drive.mount("/content/drive")
+
+PROJECT = DRIVE / "Cloud_ERP_Fresh_Project"
+STEP3_ROOT = PROJECT / "Step3_Test_Evaluation"
+
+# Leave blank to use the newest completed Step 3 run.
+STEP3_RUN_NAME = ""
+
+# This key selects the QXNN forecast recorded by Step 3.
+FORECAST_KEY = "clarknet_qxnn_forecast"
+
+candidates = (
+    [STEP3_ROOT / STEP3_RUN_NAME]
+    if STEP3_RUN_NAME
+    else sorted(STEP3_ROOT.glob("Run_*"), reverse=True)
+)
+
+step3_run = None
+for candidate in candidates:
+    summary_path = candidate / "Step3_Summary.json"
+    if summary_path.is_file():
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        if summary.get("status") == "ready":
+            step3_run = candidate
+            break
+
+if step3_run is None:
+    raise FileNotFoundError("Run Step 3 until it prints STEP 3 COMPLETE.")
+
+if FORECAST_KEY not in summary:
+    raise KeyError(f"Step 3 summary does not contain {FORECAST_KEY}.")
+
+forecast_path = Path(summary[FORECAST_KEY])
+if not forecast_path.is_file():
+    raise FileNotFoundError(f"Missing Step 3 forecast: {forecast_path}")
+
+forecast = pd.read_csv(forecast_path)
+required = ["target_window_utc", "actual_requests", "predicted_requests"]
+missing = set(required) - set(forecast.columns)
+if missing:
+    raise ValueError(f"Missing forecast columns: {sorted(missing)}")
+
+forecast = forecast[required].copy()
+forecast["target_window_utc"] = pd.to_datetime(
+    forecast["target_window_utc"], utc=True, errors="raise"
+)
+forecast = forecast.sort_values("target_window_utc").reset_index(drop=True)
+
+if forecast.empty or not forecast["target_window_utc"].is_unique:
+    raise ValueError("ClarkNet forecasts must have one unique row per minute.")
+
+gaps = forecast["target_window_utc"].diff().dropna()
+if not gaps.eq(pd.Timedelta(minutes=1)).all():
+    raise ValueError("ClarkNet forecasts must contain consecutive one-minute windows.")
+
+for column in ("actual_requests", "predicted_requests"):
+    forecast[column] = pd.to_numeric(forecast[column], errors="raise")
+
+values = forecast[["actual_requests", "predicted_requests"]].to_numpy()
+if not np.isfinite(values).all() or (values < 0).any():
+    raise ValueError("Forecast counts must be finite and nonnegative.")
+
+if not np.equal(values[:, 0], np.rint(values[:, 0])).all():
+    raise ValueError("Actual request counts must be whole numbers.")
+
+print(f"Using Step 3 run: {step3_run}")
+print(f"Forecast: {forecast_path}")
+print(f"Test workload: {len(forecast):,} minutes")
+
+# 2. Set the simulation assumptions.
+
+SETTINGS = {
+    "fixed_workers": 4,
+    "min_workers": 1,
+    "max_workers": 12,
+    "cpu_cores_per_worker": 4,
+    "memory_gb_per_worker": 8.0,
+    "cpu_seconds_per_request": 2.5,
+    "memory_gb_minutes_per_request": 0.10,
+    "priority_share": 0.25,
+    "priority_sla_minutes": 2,
+    "standard_sla_minutes": 4,
+    "forecast_headroom": 1.15,
+    "worker_idle_watts": 75,
+    "worker_full_watts": 160,
+    "pue": 1.40,
+    "electricity_inr_per_kwh": 8.00,
+    "grid_kg_co2e_per_kwh": 0.70,
+    "objective_weights": {
+        "backlog": 0.45,
+        "urgent_backlog": 0.35,
+        "energy": 0.15,
+        "worker_allocation": 0.05,
+    },
+    "workload_multipliers": {"Normal": 1.0, "High": 1.75},
+}
+
+POLICIES = ("FCFS", "EDF", "DTIRS_Inspired")
+
+CPU_PER_WORKER = SETTINGS["cpu_cores_per_worker"]
+MEM_PER_WORKER = SETTINGS["memory_gb_per_worker"]
+CPU_PER_REQUEST = SETTINGS["cpu_seconds_per_request"]
+MEM_PER_REQUEST = SETTINGS["memory_gb_minutes_per_request"]
+
+REQUESTS_PER_WORKER = min(
+    math.floor(CPU_PER_WORKER * 60 / CPU_PER_REQUEST),
+    math.floor(MEM_PER_WORKER / MEM_PER_REQUEST),
+)
+if REQUESTS_PER_WORKER < 1:
+    raise ValueError("One worker must have enough CPU and memory to serve a request.")
+
+print(f"Simulated capacity per worker: {REQUESTS_PER_WORKER} requests/minute")
+
+
+def energy_for_minute(workers, served):
+    cpu_util = served * CPU_PER_REQUEST / (workers * CPU_PER_WORKER * 60)
+    idle = SETTINGS["worker_idle_watts"]
+    full = SETTINGS["worker_full_watts"]
+    it_watts = workers * (idle + (full - idle) * cpu_util)
+    return it_watts * SETTINGS["pue"] / 60_000
+
+
+def choose_workers(predicted_arrivals, backlog, urgent_backlog):
+    """Choose capacity using the forecast and backlog known at minute start."""
+    demand = math.ceil(predicted_arrivals * SETTINGS["forecast_headroom"]) + backlog
+    maximum = SETTINGS["max_workers"]
+    maximum_energy = energy_for_minute(maximum, maximum * REQUESTS_PER_WORKER)
+    weights = SETTINGS["objective_weights"]
+
+    def score(workers):
+        capacity = workers * REQUESTS_PER_WORKER
+        expected_served = min(demand, capacity)
+
+        return (
+            weights["backlog"] * max(0, demand - capacity) / max(demand, 1)
+            + weights["urgent_backlog"]
+            * max(0, urgent_backlog - capacity) / max(urgent_backlog, 1)
+            + weights["energy"] * energy_for_minute(workers, expected_served) / maximum_energy
+            + weights["worker_allocation"] * workers / maximum
+        )
+
+    return min(
+        range(SETTINGS["min_workers"], maximum + 1),
+        key=lambda workers: (score(workers), workers),
+    )
+
+
+# 3. Simulate the same arrivals and SLA deadlines under each policy.
+
+def simulate(policy, arrivals, predictions, timestamps):
+    minutes = len(arrivals)
+    queue = []
+    sequence = 0
+    backlog = 0
+    total_latency = 0
+
+    # Some deadlines extend beyond the observation window.
+    max_sla = max(SETTINGS["priority_sla_minutes"], SETTINGS["standard_sla_minutes"])
+    due = np.zeros(minutes + max_sla, dtype=np.int64)
+    on_time_by_due = np.zeros_like(due)
+    records = []
+
+    for t, (actual, predicted) in enumerate(zip(arrivals, predictions)):
+        if policy == "DTIRS_Inspired":
+            urgent = sum(
+                count for _, _, _, deadline, count in queue if deadline <= t
+            )
+            workers = choose_workers(float(predicted), backlog, urgent)
+        else:
+            workers = SETTINGS["fixed_workers"]
+
+        # Provisioning above occurs before this minute's actual arrivals enter the queue.
+        actual = int(actual)
+        priority = int(np.rint(actual * SETTINGS["priority_share"]))
+
+        batches = (
+            (priority, SETTINGS["priority_sla_minutes"]),
+            (actual - priority, SETTINGS["standard_sla_minutes"]),
+        )
+
+        for count, sla in batches:
+            if count == 0:
+                continue
+            deadline = t + sla - 1
+            order = t if policy == "FCFS" else deadline
+            heapq.heappush(queue, (order, sequence, t, deadline, count))
+            sequence += 1
+            due[deadline] += count
+            backlog += count
+
+        capacity = workers * REQUESTS_PER_WORKER
+        remaining_capacity = capacity
+        served = 0
+
+        while queue and remaining_capacity:
+            order, batch_id, arrival_time, deadline, count = heapq.heappop(queue)
+            completed = min(count, remaining_capacity)
+            served += completed
+            backlog -= completed
+            remaining_capacity -= completed
+            total_latency += completed * (t - arrival_time + 1)
+
+            if t <= deadline:
+                on_time_by_due[deadline] += completed
+
+            if completed < count:
+                heapq.heappush(
+                    queue,
+                    (order, batch_id, arrival_time, deadline, count - completed),
+                )
+
+        records.append({
+            "target_window_utc": timestamps.iloc[t],
+            "actual_arrivals": actual,
+            "forecast_arrivals": float(predicted),
+            "workers": workers,
+            "capacity_requests": capacity,
+            "completed_requests": served,
+            "end_of_minute_backlog": backlog,
+            "allocated_cpu_core_minutes": workers * CPU_PER_WORKER,
+            "allocated_memory_gb_minutes": workers * MEM_PER_WORKER,
+            "cpu_used_core_minutes": served * CPU_PER_REQUEST / 60,
+            "memory_used_gb_minutes": served * MEM_PER_REQUEST,
+            "facility_energy_kwh": energy_for_minute(workers, served),
+        })
+
+    detail = pd.DataFrame(records)
+    detail["sla_requests_due"] = due[:minutes]
+    detail["sla_misses"] = (due - on_time_by_due)[:minutes]
+
+    total_arrivals = int(arrivals.sum())
+    completed = int(detail["completed_requests"].sum())
+    due_count = int(detail["sla_requests_due"].sum())
+    misses = int(detail["sla_misses"].sum())
+    energy = float(detail["facility_energy_kwh"].sum())
+
+    if completed + backlog != total_arrivals or not 0 <= misses <= due_count:
+        raise RuntimeError(f"Request accounting failed for {policy}.")
+
+    metrics = {
+        "scheduler": policy,
+        "workload_minutes": minutes,
+        "arrivals": total_arrivals,
+        "completed_requests": completed,
+        "pending_at_end": backlog,
+        "throughput_requests_per_minute": completed / minutes,
+        "mean_response_minutes_completed": total_latency / completed if completed else np.nan,
+        "sla_requests_due": due_count,
+        "sla_misses": misses,
+        "sla_violation_pct": 100 * misses / due_count if due_count else np.nan,
+        "mean_workers": detail["workers"].mean(),
+        "cpu_utilization_pct": 100 * detail["cpu_used_core_minutes"].sum()
+        / detail["allocated_cpu_core_minutes"].sum(),
+        "memory_utilization_pct": 100 * detail["memory_used_gb_minutes"].sum()
+        / detail["allocated_memory_gb_minutes"].sum(),
+        "facility_energy_kwh": energy,
+        "electricity_cost_inr": energy * SETTINGS["electricity_inr_per_kwh"],
+        "estimated_carbon_kg_co2e": energy * SETTINGS["grid_kg_co2e_per_kwh"],
+    }
+    return detail, metrics
+
+
+# 4. Run the scenarios and save the results.
+
+run_name = datetime.now(timezone.utc).strftime("Run_%Y%m%d_%H%M%S_%f")
+OUT = PROJECT / "Step4_Scheduling_Simulation" / run_name
+OUT.mkdir(parents=True, exist_ok=False)
+
+all_metrics = []
+all_details = []
+
+for scenario, multiplier in SETTINGS["workload_multipliers"].items():
+    arrivals = np.rint(forecast["actual_requests"].to_numpy() * multiplier).astype(np.int64)
+    predictions = forecast["predicted_requests"].to_numpy() * multiplier
+
+    for policy in POLICIES:
+        detail, metrics = simulate(
+            policy, arrivals, predictions, forecast["target_window_utc"]
+        )
+        detail.insert(0, "scenario", scenario)
+        detail.insert(1, "scheduler", policy)
+        all_details.append(detail)
+        all_metrics.append({"scenario": scenario, **metrics})
+
+results = pd.DataFrame(all_metrics)
+minute_results = pd.concat(all_details, ignore_index=True)
+
+results.to_csv(OUT / "Scheduling_Metrics.csv", index=False)
+minute_results.to_csv(OUT / "Scheduling_Per_Minute.csv", index=False)
+
+display(results.round(4))
+
+# 5. Compare scheduling results visually.
+
+fig, axes = plt.subplots(2, 2, figsize=(14, 9), constrained_layout=True)
+
+plot_metrics = (
+    ("sla_violation_pct", "SLA violations (%)"),
+    ("mean_response_minutes_completed", "Mean response time (minutes)"),
+    ("facility_energy_kwh", "Facility energy (kWh)"),
+    ("throughput_requests_per_minute", "Throughput (requests/minute)"),
+)
+
+for ax, (column, label) in zip(axes.flat, plot_metrics):
+    table = results.pivot(index="scenario", columns="scheduler", values=column)
+    table = table.reindex(
+        index=list(SETTINGS["workload_multipliers"]), columns=list(POLICIES)
+    )
+    table.plot.bar(ax=ax, rot=0)
+    ax.set_xlabel("")
+    ax.set_ylabel(label)
+    ax.set_title(label)
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend(title=None, fontsize=8)
+
+fig.suptitle("Cloud ERP scheduling simulation")
+fig.savefig(OUT / "Scheduling_Comparison.png", dpi=180, bbox_inches="tight")
+plt.show()
+plt.close(fig)
+
+(OUT / "Step4_Summary.json").write_text(
+    json.dumps({
+        "status": "ready",
+        "step3_run": str(step3_run),
+        "forecast_file": str(forecast_path),
+        "settings": SETTINGS,
+        "requests_per_worker_per_minute": REQUESTS_PER_WORKER,
+        "sla_denominator": "Requests with deadlines within the simulation window",
+        "response_time_population": "Completed requests only",
+        "metrics_file": "Scheduling_Metrics.csv",
+        "minute_log": "Scheduling_Per_Minute.csv",
+        "comparison_figure": "Scheduling_Comparison.png",
+    }, indent=2),
+    encoding="utf-8",
+)
+
+print("\nSTEP 4 COMPLETE")
+print(f"Output folder: {OUT}")
