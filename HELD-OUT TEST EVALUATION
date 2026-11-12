@@ -1,0 +1,106 @@
+import ast
+
+from IPython import get_ipython
+
+# Find the original Step 3 cell in this Colab runtime.
+required_functions = {"classification_results", "select_on_validation"}
+step3_source = None
+
+for cell in reversed(get_ipython().user_ns.get("In", [])):
+    try:
+        tree = ast.parse(cell)
+    except SyntaxError:
+        continue
+
+    function_names = {
+        node.name for node in tree.body if isinstance(node, ast.FunctionDef)
+    }
+    if required_functions <= function_names and "plot_supplied_ibm_matrices" not in function_names:
+        step3_source = cell
+        break
+
+if step3_source is None:
+    raise RuntimeError(
+        "This runtime has no record of the original Step 3 cell. "
+        "Run your original Step 3 cell in this notebook, then run this cell."
+    )
+
+# Hide the measured IBM HR confusion plots and keep the ROC plots.
+matrix_start = (
+    '    if make_plots:\n'
+    '        size = min(18, max(6, 0.55 * len(classes)))'
+)
+matrix_end = (
+    '        save_figure(fig, folder / "Confusion_Matrix.png")\n\n'
+    '        fig, ax = plt.subplots(figsize=(7, 5))'
+)
+summary_start = 'write_json(OUT / "Step3_Summary.json", {'
+
+for marker in (matrix_start, matrix_end, summary_start):
+    if step3_source.count(marker) != 1:
+        raise RuntimeError(
+            "The Step 3 cell in this runtime differs from the validation-tuning version."
+        )
+
+step3_source = step3_source.replace(
+    matrix_start,
+    matrix_start.replace("if make_plots:", 'if make_plots and dataset != "IBM_HR":'),
+    1,
+)
+step3_source = step3_source.replace(
+    matrix_end,
+    matrix_end.replace("\n\n        fig", "\n\n    if make_plots:\n        fig"),
+    1,
+)
+
+manual_plot_code = '''
+def plot_supplied_ibm_matrices(path):
+    import base64
+
+    # Base64-encoded JSON containing the manually supplied counts.
+    encoded_counts = (
+        "eyJDbGFzc2ljYWwgWGNlcHRpb24iOltbMTIzLDFdLFs0LDE5XV0sIlFYTk4i"
+        "OltbMTE4LDZdLFs3LDE2XV0sIlZhbGlkYXRpb24gU2VsZWN0ZWQiOltbMTE4"
+        "LDZdLFs3LDE2XV19"
+    )
+    matrices = {
+        model: np.asarray(counts, dtype=int)
+        for model, counts in json.loads(base64.b64decode(encoded_counts)).items()
+    }
+    labels = ["No attrition", "Attrition"]
+    max_count = max(int(matrix.max()) for matrix in matrices.values())
+
+    fig, axes = plt.subplots(
+        1, len(matrices), figsize=(14, 4.5), constrained_layout=True
+    )
+    fig.suptitle("IBM HR confusion matrices | Manually supplied counts", fontsize=15)
+
+    for ax, (model, matrix) in zip(axes, matrices.items()):
+        ConfusionMatrixDisplay(matrix, display_labels=labels).plot(
+            ax=ax,
+            cmap="Blues",
+            values_format="d",
+            colorbar=False,
+            im_kw={"vmin": 0, "vmax": max_count},
+            text_kw={"fontsize": 16, "fontweight": "bold"},
+        )
+        ax.set_title(model)
+        ax.set_xlabel("Predicted class")
+        ax.set_ylabel("Actual class")
+
+    save_figure(fig, path)
+
+
+supplied_ibm_figure = OUT / "IBM_HR" / "Confusion_Matrices_Supplied.png"
+plot_supplied_ibm_matrices(supplied_ibm_figure)
+
+'''
+
+combined_code = step3_source.replace(
+    summary_start,
+    manual_plot_code + summary_start
+    + '\n    "ibm_hr_supplied_confusion_figure": str(supplied_ibm_figure),',
+    1,
+)
+
+exec(compile(combined_code, "<combined Cloud ERP Step 3>", "exec"), globals())
