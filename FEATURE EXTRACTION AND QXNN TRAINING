@@ -1,0 +1,691 @@
+# ============================================================
+# CLOUD ERP STEP 2 — FEATURE EXTRACTION AND QXNN TRAINING
+# Full replacement cell with the SentencePiece compatibility fix.
+# ============================================================
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import torch
+from google.colab import drive, userdata
+
+# 1. Runtime and paths
+
+if not torch.cuda.is_available():
+    raise RuntimeError("Enable a GPU under Runtime → Change runtime type.")
+
+drive_root = Path("/content/drive/MyDrive")
+if not drive_root.is_dir():
+    drive.mount("/content/drive")
+
+project = drive_root / "Cloud_ERP_Fresh_Project"
+
+# Leave blank to use the newest completed Step 1 run.
+STEP1_RUN = ""
+
+if not STEP1_RUN and not (project / "Step1_Preprocessed").is_dir():
+    raise FileNotFoundError(f"Step 1 output folder is missing under {project}.")
+
+try:
+    token = (userdata.get("HF_TOKEN") or "").strip()
+except (userdata.SecretNotFoundError, userdata.NotebookAccessError):
+    raise RuntimeError(
+        "Add HF_TOKEN under Colab Secrets and enable Notebook access."
+    ) from None
+
+if not token:
+    raise RuntimeError("HF_TOKEN is empty. Check the value in Colab Secrets.")
+
+# 2. Isolated packages and SentencePiece fix
+
+deps = Path("/content/cloud_erp_fresh_step2_deps")
+package_marker = deps / ".installed-v1"
+
+if not package_marker.is_file():
+    print("Installing Step 2 model packages...", flush=True)
+    subprocess.run(
+        [
+            sys.executable, "-m", "pip", "install", "-q", "--upgrade",
+            "--target", str(deps), "--no-deps",
+            "transformers==4.57.6",
+            "huggingface-hub==0.36.2",
+            "tokenizers>=0.22,<=0.23.0",
+            "safetensors>=0.4.3",
+            "hf-xet>=1.1.3,<2",
+            "accelerate==1.12.0",
+            "bitsandbytes==0.49.2",
+        ],
+        check=True,
+    )
+    package_marker.touch()
+
+# Put the pinned package ahead of any previously installed SentencePiece.
+fix_dir = Path("/content/cloud_erp_sentencepiece_fix")
+fix_marker = fix_dir / ".sentencepiece-0.2.1"
+
+if not fix_marker.is_file():
+    print("Installing compatible SentencePiece 0.2.1...", flush=True)
+    subprocess.run(
+        [
+            sys.executable, "-m", "pip", "install", "-q", "--upgrade",
+            "--target", str(fix_dir), "--no-deps", "--only-binary=:all:",
+            "sentencepiece==0.2.1",
+        ],
+        check=True,
+    )
+    fix_marker.touch()
+
+env = os.environ.copy()
+env["HF_TOKEN"] = token
+env["ERP_PROJECT"] = str(project)
+env["ERP_STEP1_RUN"] = STEP1_RUN
+env["PYTHONPATH"] = os.pathsep.join(
+    part for part in (str(fix_dir), str(deps), env.get("PYTHONPATH", "")) if part
+)
+
+subprocess.run(
+    [
+        sys.executable, "-c",
+        "import sentencepiece; "
+        "from sentencepiece import sentencepiece_model_pb2; "
+        "assert sentencepiece.__version__ == '0.2.1'; "
+        "print('Tokenizer dependency OK. SentencePiece:', sentencepiece.__version__)",
+    ],
+    env=env,
+    check=True,
+)
+
+# 3. Complete training code. Colab creates the worker file automatically.
+
+worker_code = r'''
+import gc
+import hashlib
+import json
+import os
+import random
+import shutil
+from datetime import datetime, timezone
+from pathlib import Path
+from uuid import uuid4
+
+import joblib
+import numpy as np
+import pandas as pd
+import torch
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import f1_score, mean_absolute_error
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
+
+PROJECT = Path(os.environ["ERP_PROJECT"])
+DATASETS = ("SAP", "IBM_HR", "ClarkNet")
+SPLITS = ("train", "validation", "test")
+
+ENCODERS = (
+    ("Llama", "TinyLlama/TinyLlama-1.1B-Chat-v1.0", False),
+    ("Mistral", "mistralai/Mistral-7B-v0.3", True),
+    ("Qwen", "Qwen/Qwen2.5-0.5B", False),
+    ("Gemma", "google/gemma-2-2b", False),
+)
+
+DEVICE = torch.device("cuda:0")
+SEED = 42
+MAX_TOKENS = 128
+EMBED_BATCH = 16
+CACHE_CHUNK = 512
+TRAIN_BATCH = 32
+MAX_EPOCHS = 30
+PATIENCE = 8
+QUBITS = 8
+CIRCUIT_DEPTH = 4
+FUSION_WIDTH = 768
+
+
+def write_json(path, value):
+    path.write_text(json.dumps(value, indent=2), encoding="utf-8")
+
+
+def find_step1_run():
+    override = os.environ.get("ERP_STEP1_RUN", "").strip()
+    candidates = (
+        [Path(override)] if override else
+        sorted((PROJECT / "Step1_Preprocessed").glob("Run_*"), reverse=True)
+    )
+
+    for run in candidates:
+        summary = run / "Step1_Summary.json"
+        if summary.is_file():
+            status = json.loads(summary.read_text(encoding="utf-8"))
+            if all(status.get(name, {}).get("status") == "ready" for name in DATASETS):
+                return run
+
+    raise FileNotFoundError("No completed Step 1 run found. Check STEP1_RUN and Step1_Summary.json.")
+
+
+def load_dataset(run, name):
+    folder = run / name
+    meta = json.loads((folder / "metadata.json").read_text(encoding="utf-8"))
+    text_cols = ["record_id", "semantic_text", *meta["categorical_features"]]
+
+    if meta["task"] == "classification":
+        text_cols.append("target")
+
+    frames = {}
+    for split in SPLITS:
+        frame = pd.read_csv(
+            folder / f"{split}.csv",
+            dtype={col: "string" for col in text_cols},
+            keep_default_na=False,
+        )
+        if frame.empty or len(frame) != meta["splits"][split]["rows"]:
+            raise ValueError(f"{name}/{split}: row count differs from Step 1 metadata.")
+        if frame["semantic_text"].str.strip().eq("").any():
+            raise ValueError(f"{name}/{split}: missing semantic text.")
+        frames[split] = frame
+
+    texts = pd.concat([frames[split]["semantic_text"] for split in SPLITS], ignore_index=True)
+    codes, unique = pd.factorize(texts, sort=False)
+    indices = {}
+    offset = 0
+    for split in SPLITS:
+        end = offset + len(frames[split])
+        indices[split] = codes[offset:end]
+        offset = end
+
+    return {"meta": meta, "frames": frames, "texts": unique.tolist(), "indices": indices}
+
+
+def prepare_tabular(meta, frames):
+    numeric = meta["numeric_features"]
+    categorical = meta["categorical_features"]
+    clean = {}
+
+    for split, frame in frames.items():
+        table = frame[numeric + categorical].copy()
+        for column in numeric:
+            table[column] = pd.to_numeric(table[column], errors="coerce").replace(
+                [np.inf, -np.inf], np.nan
+            )
+        for column in categorical:
+            table[column] = table[column].replace("", "__MISSING__").astype(str)
+        clean[split] = table
+
+    preprocessor = ColumnTransformer([
+        ("numeric", make_pipeline(
+            SimpleImputer(strategy="median", keep_empty_features=True),
+            MinMaxScaler(),
+        ), numeric),
+        ("categorical", OneHotEncoder(
+            handle_unknown="ignore", sparse_output=False
+        ), categorical),
+    ])
+
+    preprocessor.fit(clean["train"])
+    arrays = {
+        split: preprocessor.transform(clean[split]).astype(np.float32)
+        for split in SPLITS
+    }
+    return preprocessor, arrays
+
+
+def load_encoder(model_id, use_4bit):
+    from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig
+
+    token = os.environ["HF_TOKEN"]
+    dtype = torch.float16
+    options = {
+        "token": token,
+        "use_safetensors": True,
+        "low_cpu_mem_usage": True,
+    }
+
+    if model_id == "google/gemma-2-2b":
+        dtype = (
+            torch.bfloat16
+            if torch.cuda.is_bf16_supported(including_emulation=False)
+            else torch.float32
+        )
+        options["attn_implementation"] = "eager"
+
+    if use_4bit:
+        options["device_map"] = {"": 0}
+        options["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=dtype,
+            bnb_4bit_use_double_quant=True,
+        )
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id, token=token)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModel.from_pretrained(model_id, torch_dtype=dtype, **options)
+    if not use_4bit:
+        model.to(DEVICE)
+
+    return tokenizer, model.eval()
+
+
+@torch.inference_mode()
+def encode_chunk(texts, tokenizer, model):
+    blocks = []
+    for start in range(0, len(texts), EMBED_BATCH):
+        batch = tokenizer(
+            texts[start:start + EMBED_BATCH],
+            padding=True, truncation=True,
+            max_length=MAX_TOKENS, return_tensors="pt",
+        ).to(DEVICE)
+        hidden = model(**batch, use_cache=False).last_hidden_state.float()
+        mask = batch["attention_mask"].unsqueeze(-1)
+        pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1)
+        pooled = nn.functional.normalize(pooled, dim=-1)
+        if not torch.isfinite(pooled).all():
+            raise FloatingPointError("A text encoder produced nonfinite embeddings.")
+        blocks.append(pooled.cpu().numpy().astype(np.float16))
+
+    return np.concatenate(blocks)
+
+
+def build_embedding_cache(corpus, cache_root):
+    cache = {}
+    for family, model_id, use_4bit in ENCODERS:
+        tokenizer = model = None
+
+        try:
+            for dataset, entry in corpus.items():
+                texts = entry["texts"]
+
+                # Keep the same cache fingerprint as the previous Step 2 cell.
+                descriptor = [
+                    model_id, use_4bit, MAX_TOKENS, CACHE_CHUNK, "mean_l2_v1", texts
+                ]
+                digest = hashlib.sha256(
+                    json.dumps(descriptor, ensure_ascii=False).encode("utf-8")
+                ).hexdigest()[:24]
+
+                folder = cache_root / family / dataset / digest
+                folder.mkdir(parents=True, exist_ok=True)
+                parts = []
+
+                for start in range(0, len(texts), CACHE_CHUNK):
+                    end = min(start + CACHE_CHUNK, len(texts))
+                    path = folder / f"{start:08d}.npy"
+                    if not path.is_file():
+                        if model is None:
+                            print(f"Loading {model_id}...", flush=True)
+                            tokenizer, model = load_encoder(model_id, use_4bit)
+                        array = encode_chunk(texts[start:end], tokenizer, model)
+                        temporary = folder / f".{uuid4().hex}.tmp"
+                        try:
+                            with temporary.open("wb") as handle:
+                                np.save(handle, array, allow_pickle=False)
+                            temporary.replace(path)
+                        finally:
+                            temporary.unlink(missing_ok=True)
+                        print(f"{family}/{dataset}: {end:,}/{len(texts):,}", flush=True)
+                    parts.append(path)
+
+                cache[dataset, family] = parts
+                print(f"{family}/{dataset}: embeddings ready", flush=True)
+        finally:
+            del model, tokenizer
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    return cache
+
+
+class QuantumCircuit(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.angles = nn.Parameter(torch.empty(CIRCUIT_DEPTH, QUBITS, 2))
+        nn.init.uniform_(self.angles, -0.1, 0.1)
+
+        basis = torch.arange(2 ** QUBITS)
+        bits = [(basis >> (QUBITS - wire - 1)) & 1 for wire in range(QUBITS)]
+        self.register_buffer(
+            "z_signs", torch.stack([1 - 2 * bit for bit in bits], dim=1).float()
+        )
+
+        ring = basis
+        for wire, bit in enumerate(bits):
+            target = (wire + 1) % QUBITS
+            ring = ring[basis ^ (bit << (QUBITS - target - 1))]
+        self.register_buffer("ring", ring)
+
+    @staticmethod
+    def rotate_y(state, theta, wire):
+        view = state.reshape(len(state), 2 ** wire, 2, 2 ** (QUBITS - wire - 1))
+        zero, one = view.unbind(dim=2)
+        cosine = (theta / 2).cos().reshape(-1, 1, 1)
+        sine = (theta / 2).sin().reshape(-1, 1, 1)
+        return torch.stack(
+            (cosine * zero - sine * one, sine * zero + cosine * one), dim=2
+        ).flatten(1)
+
+    def forward(self, inputs):
+        encoded = torch.pi * inputs.float().tanh()
+        state = torch.zeros(
+            (len(inputs), 2 ** QUBITS), device=inputs.device, dtype=torch.complex64
+        )
+        state[:, 0] = 1
+
+        for wire in range(QUBITS):
+            state = self.rotate_y(state, encoded[:, wire], wire)
+
+        for layer in self.angles:
+            for wire, theta in enumerate(layer[:, 0]):
+                state = self.rotate_y(state, theta, wire)
+            phase = self.z_signs @ (-layer[:, 1] / 2)
+            state = (state * torch.polar(torch.ones_like(phase), phase)).index_select(1, self.ring)
+
+        probability = state.real.square() + state.imag.square()
+        return probability @ self.z_signs
+
+
+class SeparableBlock(nn.Module):
+    def __init__(self, incoming, outgoing):
+        super().__init__()
+        self.main = nn.Sequential(
+            nn.Conv2d(incoming, incoming, 3, padding=1, groups=incoming, bias=False),
+            nn.Conv2d(incoming, outgoing, 1, bias=False),
+            nn.BatchNorm2d(outgoing),
+            nn.ReLU(),
+            nn.Conv2d(outgoing, outgoing, 3, padding=1, groups=outgoing, bias=False),
+            nn.Conv2d(outgoing, outgoing, 1, bias=False),
+            nn.BatchNorm2d(outgoing),
+        )
+        self.skip = nn.Conv2d(incoming, outgoing, 1, bias=False)
+
+    def forward(self, x):
+        return (self.main(x) + self.skip(x)).relu()
+
+
+class ERPXception(nn.Module):
+    def __init__(self, semantic_dims, tabular_dim, outputs, quantum):
+        super().__init__()
+        self.projections = nn.ModuleList(
+            nn.Sequential(nn.Linear(width, FUSION_WIDTH), nn.LayerNorm(FUSION_WIDTH))
+            for width in semantic_dims
+        )
+        self.fusion_weights = nn.Parameter(torch.zeros(len(semantic_dims)))
+        self.tabular = nn.Linear(tabular_dim, FUSION_WIDTH)
+        self.backbone = nn.Sequential(
+            nn.Conv2d(2, 24, 3, padding=1, bias=False),
+            nn.BatchNorm2d(24),
+            nn.ReLU(),
+            SeparableBlock(24, 32),
+            nn.MaxPool2d(2),
+            SeparableBlock(32, 48),
+            nn.MaxPool2d(2),
+            SeparableBlock(48, 64),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Dropout(0.3),
+            nn.Linear(64, QUBITS),
+        )
+        self.bottleneck = (
+            QuantumCircuit() if quantum else nn.Sequential(nn.Linear(QUBITS, QUBITS), nn.Tanh())
+        )
+        self.head = nn.Linear(QUBITS, outputs)
+
+    def forward(self, tabular, *embeddings):
+        projected = torch.stack([
+            layer(embedding.float())
+            for layer, embedding in zip(self.projections, embeddings)
+        ], dim=1)
+        semantic = (projected * self.fusion_weights.softmax(dim=0)[None, :, None]).sum(dim=1)
+        grid = torch.stack((semantic, self.tabular(tabular)), dim=1).reshape(-1, 2, 24, 32)
+        return self.head(self.bottleneck(self.backbone(grid)))
+
+
+def prepare_targets(task, frames):
+    if task == "classification":
+        labels = sorted(set(frames["train"]["target"]))
+        lookup = {label: index for index, label in enumerate(labels)}
+        targets = {}
+        for split in ("train", "validation"):
+            encoded = frames[split]["target"].map(lookup)
+            if encoded.isna().any() or "" in lookup or len(labels) < 2:
+                raise ValueError(f"Missing or unknown class labels in {split}.")
+            targets[split] = encoded.to_numpy(dtype=np.int64)
+        return targets, {"classes": labels, "outputs": len(labels), "metric": "macro_f1"}
+
+    raw = {
+        split: frames[split]["target"].to_numpy(dtype=np.float32)
+        for split in ("train", "validation")
+    }
+    if any((~np.isfinite(values) | (values < 0)).any() for values in raw.values()):
+        raise ValueError("Workload targets must be finite and nonnegative.")
+    mean = float(raw["train"].mean())
+    scale = float(raw["train"].std()) or 1.0
+    targets = {split: (values - mean) / scale for split, values in raw.items()}
+    return targets, {
+        "outputs": 1, "target_mean": mean, "target_scale": scale, "metric": "mae_requests",
+    }
+
+
+def run_epoch(model, loader, loss_fn, classification, optimizer=None):
+    training = optimizer is not None
+    model.train(training)
+    total_loss = 0.0
+    truth, predictions = [], []
+
+    with torch.set_grad_enabled(training):
+        for batch in loader:
+            *inputs, target = [tensor.to(DEVICE, non_blocking=True) for tensor in batch]
+            output = model(*inputs)
+            if not classification:
+                output = output[:, 0]
+
+            loss = loss_fn(output, target)
+            if not torch.isfinite(loss):
+                raise FloatingPointError("Nonfinite training or validation loss.")
+
+            if training:
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
+            else:
+                predicted = output.argmax(dim=1) if classification else output
+                predictions.append(predicted.cpu().numpy())
+                truth.append(target.cpu().numpy())
+
+            total_loss += loss.item() * len(target)
+
+    evaluation = (np.concatenate(truth), np.concatenate(predictions)) if not training else None
+    return total_loss / len(loader.dataset), evaluation
+
+
+def train_variant(folder, variant, config, features, targets):
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    classification = config["task"] == "classification"
+
+    model = ERPXception(
+        config["semantic_dims"], config["tabular_dim"], config["outputs"],
+        quantum=variant == "QXNN",
+    ).to(DEVICE)
+
+    if classification:
+        counts = np.bincount(targets["train"], minlength=config["outputs"])
+        weights = torch.tensor(
+            np.sqrt(counts.max() / counts), dtype=torch.float32, device=DEVICE
+        )
+        loss_fn = nn.CrossEntropyLoss(weight=weights)
+    else:
+        loss_fn = nn.MSELoss()
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, factor=0.5, patience=3
+    )
+
+    loaders = {}
+    for split in ("train", "validation"):
+        tensors = [torch.from_numpy(x) for x in [*features[split], targets[split]]]
+        loaders[split] = DataLoader(
+            TensorDataset(*tensors),
+            batch_size=TRAIN_BATCH,
+            shuffle=split == "train",
+            generator=torch.Generator().manual_seed(SEED),
+            pin_memory=True,
+        )
+
+    history = []
+    best_rank, best_value, best_epoch = -np.inf, None, 0
+    checkpoint = folder / f"{variant}_Best.pt"
+
+    for epoch in range(1, MAX_EPOCHS + 1):
+        train_loss, _ = run_epoch(
+            model, loaders["train"], loss_fn, classification, optimizer
+        )
+        val_loss, (truth, predicted) = run_epoch(
+            model, loaders["validation"], loss_fn, classification
+        )
+
+        if classification:
+            value = float(f1_score(
+                truth, predicted, labels=np.arange(config["outputs"]),
+                average="macro", zero_division=0,
+            ))
+        else:
+            scale, mean = config["target_scale"], config["target_mean"]
+            value = float(mean_absolute_error(
+                truth * scale + mean, np.maximum(predicted * scale + mean, 0)
+            ))
+
+        rank = value if classification else -value
+        scheduler.step(-rank)
+        history.append({
+            "epoch": epoch, "train_loss": train_loss, "validation_loss": val_loss,
+            config["metric"]: value,
+        })
+        print(
+            f"{folder.name}/{variant} epoch {epoch:02d} | "
+            f"train loss={train_loss:.4f} | {config['metric']}={value:.4f}",
+            flush=True,
+        )
+
+        if rank > best_rank:
+            best_rank, best_value, best_epoch = rank, value, epoch
+            temporary = checkpoint.with_suffix(".tmp")
+            torch.save({
+                "state_dict": model.state_dict(), "config": config, "variant": variant,
+            }, temporary)
+            temporary.replace(checkpoint)
+
+        if epoch - best_epoch >= PATIENCE:
+            break
+
+    pd.DataFrame(history).to_csv(folder / f"{variant}_History.csv", index=False)
+    return {
+        "dataset": folder.name, "variant": variant, "best_epoch": best_epoch,
+        "metric": config["metric"], "validation_score": best_value,
+    }
+
+
+def main():
+    step1 = find_step1_run()
+    print(f"Using completed Step 1 run: {step1}", flush=True)
+
+    root = PROJECT / "Step2_QXNN"
+    corpus = {name: load_dataset(step1, name) for name in DATASETS}
+    cache = build_embedding_cache(corpus, root / "Embedding_Cache")
+
+    run = root / datetime.now(timezone.utc).strftime("Run_%Y%m%d_%H%M%S_%f")
+    run.mkdir(parents=True, exist_ok=False)
+    shutil.copyfile(__file__, run / "Step2_Training_Source.py")
+    print(f"Step 2 output folder: {run}", flush=True)
+
+    comparison = []
+    for name, entry in corpus.items():
+        folder = run / name
+        folder.mkdir()
+        meta, frames = entry["meta"], entry["frames"]
+        preprocessor, tabular = prepare_tabular(meta, frames)
+        targets, task_config = prepare_targets(meta["task"], frames)
+
+        features = {split: [tabular[split]] for split in SPLITS}
+        dimensions = []
+
+        for family, _, _ in ENCODERS:
+            vectors = np.concatenate([
+                np.load(path, allow_pickle=False) for path in cache[name, family]
+            ])
+            if vectors.ndim != 2 or len(vectors) != len(entry["texts"]):
+                raise ValueError(f"Embedding cache mismatch for {name}/{family}.")
+            dimensions.append(vectors.shape[1])
+
+            for split in SPLITS:
+                features[split].append(vectors[entry["indices"][split]])
+            del vectors
+
+        order = ["tabular", *[family for family, _, _ in ENCODERS]]
+        config = {
+            "dataset": name,
+            "task": meta["task"],
+            "semantic_dims": dimensions,
+            "tabular_dim": tabular["train"].shape[1],
+            "feature_order": order,
+            "model_ids": [model_id for _, model_id, _ in ENCODERS],
+            "tabular_feature_names": preprocessor.get_feature_names_out().tolist(),
+            **task_config,
+        }
+        write_json(folder / "Model_Config.json", config)
+        joblib.dump(preprocessor, folder / "Tabular_Preprocessor.joblib")
+
+        test = frames["test"]
+        id_column = "target_window_utc" if name == "ClarkNet" else "record_id"
+        target_dtype = np.float32 if name == "ClarkNet" else str
+        np.savez(
+            folder / "Test_Inputs.npz",
+            **dict(zip(order, features.pop("test"))),
+            row_id=test[id_column].to_numpy(dtype=str),
+            target_original=test["target"].to_numpy(dtype=target_dtype),
+        )
+
+        for variant in ("Classical_Xception", "QXNN"):
+            comparison.append(train_variant(folder, variant, config, features, targets))
+
+    table = pd.DataFrame(comparison)
+    table.to_csv(run / "Validation_Comparison.csv", index=False)
+    write_json(run / "Step2_Summary.json", {
+        "status": "ready", "step1_run": str(step1), "results": comparison,
+    })
+
+    print(table.to_string(index=False), flush=True)
+    print(f"STEP 2 COMPLETE\nOutput folder: {run}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+worker = Path("/content/cloud_erp_fresh_step2_worker.py")
+worker.write_text(worker_code, encoding="utf-8")
+
+# Show the worker's actual output if a later operation fails.
+with subprocess.Popen(
+    [sys.executable, "-u", str(worker)],
+    env=env,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True,
+    errors="replace",
+) as process:
+    for line in process.stdout:
+        print(line.replace(token, "[REDACTED]"), end="", flush=True)
+    exit_code = process.wait()
+
+if exit_code:
+    raise RuntimeError(
+        f"Step 2 exited with code {exit_code}. The underlying error is printed above."
+    )
